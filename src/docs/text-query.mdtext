@@ -1,25 +1,16 @@
-This module was first released with Jena 2.11.0.
+This extension to ARQ combines SPARQL and text search. It gives applications the ability to perform free text
+searches within SPARQL queries. Text indexes are additional information for accessing the RDF graph.
 
-This extension to ARQ combines SPARQL and text search.
+The text index can be either [Apache Lucene](http://lucene.apache.org/core) for a same-machine text index,
+or [Apache Solr](http://lucene.apache.org/solr/) for a large scale enterprise search application.
 
-It gives applications the ability to perform free text searches within
-SPARQL queries. Text indexes are additional information for
-accessing the RDF graph.
-
-The text index can be either [Apache Lucene](http://lucene.apache.org/core) for a
-same-machine text index, or [Apache Solr](http://lucene.apache.org/solr/)
-for a large scale enterprise search application.
-
-Some example code is [available here](https://github.com/apache/jena/tree/master/jena-text/src/main/java/examples/).
-
-This module is not compatible with the much older LARQ module.
+This module was first released with Jena 2.11.0, and is not compatible with the much older LARQ module.
 
 *Illustration*
 
-This query makes a text query for 'word' on a specific property
-(the index needs to correctly configured) and limits the output
-to 10 matches; it then looks in the RDF data for
-the actual label.  More details are given below.
+The following query is a short example that makes a text query for 'word' on a specific property (the index needs to
+correctly configured) and limits the output to 10 matches. It then looks in the RDF data for the actual label. Other
+example code is [available here](https://github.com/apache/jena/tree/master/jena-text/src/main/java/examples/).
 
     PREFIX text: <http://jena.apache.org/text#>
     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
