@@ -1,0 +1,714 @@
+This module was first released with Jena 2.11.0.
+
+This extension to ARQ combines SPARQL and text search.
+
+It gives applications the ability to perform free text searches within
+SPARQL queries. Text indexes are additional information for
+accessing the RDF graph.
+
+The text index can be either [Apache Lucene](http://lucene.apache.org/core) for a
+same-machine text index, or [Apache Solr](http://lucene.apache.org/solr/)
+for a large scale enterprise search application.
+
+Some example code is [available here](https://github.com/apache/jena/tree/master/jena-text/src/main/java/examples/).
+
+This module is not compatible with the much older LARQ module.
+
+*Illustration*
+
+This query makes a text query for 'word' on a specific property
+(the index needs to correctly configured) and limits the output
+to 10 matches; it then looks in the RDF data for
+the actual label.  More details are given below.
+
+    PREFIX text: <http://jena.apache.org/text#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+    SELECT ?s
+    { ?s text:query (rdfs:label 'word' 10) ; 
+         rdfs:label ?label 
+    }
+
+## Table of Contents
+
+-   [Architecture](#architecture)
+-   [Query with SPARQL](#query-with-sparql)
+-   [Configuration](#configuration)
+    -   [Text Dataset Assembler](#text-dataset-assembler)
+    -   [Configuring an analyzer](#configuring-an-analyzer)
+    -   [Configuration by Code](#configuration-by-code)
+    -   [Graph-specific Indexing](#graph-specific-indexing)
+    -   [Linguistic Support with Lucene Index](#linguistic-support-with-lucene-index)
+    -   [Storing Literal Values](#storing-literal-values)
+- [Working with Fuseki](#working-with-fuseki)
+- [Building a Text Index](#building-a-text-index)
+- [Deletion of Indexed Entities](#deletion-of-indexed-entities)
+- [Configuring Alternative TextDocProducers](#configuring-alternative-textdocproducers)
+- [Maven Dependency](#maven-dependency)
+
+## Architecture
+
+The text index is used provide a reverse index mapping query strings to URIs.
+The text indexed can be part of the RDF data or the text index can be used to index
+external content with only additional RDF in the RDF store.
+
+The text index uses the native query language of the index:
+[Lucene query format](http://lucene.apache.org/core/4_1_0/queryparser/org/apache/lucene/queryparser/classic/package-summary.html#package_description)
+or
+[Solr query format](http://wiki.apache.org/solr/SolrQuerySyntax).
+
+A text-supporting dataset is configured with a description of which
+properties work with.  When data is added, any properties matching the
+description cause an entry to be added from analysed text from the triple
+object and mapping to the subject.
+
+### Pattern A &ndash; RDF data
+
+In this pattern, the data in the text index is indexing literals in the RDF data.  
+Additions to the RDF data are reflected in additions to the index.
+
+(Deletes do not remove text index entries - [see below](#deletion-of-indexed-entities))
+
+### Pattern B &ndash; External content
+
+There is no requirement that the text data indexed is present in the RDF
+data.  As long as the index contains the index text documents to match the
+index description, then text search can be performed.
+
+For example, if the content of a collection of documents is indexed and the
+URI naming the document is the result of the text search, then an RDF
+dataset with the document metadata can be combined with accessing the
+content by URI.
+
+The maintenance of the index is external to the RDF data store.
+
+### External applications
+
+By using Solr, in either pattern A (RDF data indexed) or pattern B
+(external content indexed), other applications can share the
+text index with SPARQL search.
+
+## Query with SPARQL
+
+The property function is `http://jena.apache.org/text#query` more
+conveniently written:
+
+    PREFIX text: <http://jena.apache.org/text#>
+
+    ...   text:query ...
+
+This is different to LARQ v1.
+
+The following forms are all legal:
+
+    ?s text:query 'word'                   # query
+    ?s text:query (rdfs:label 'word')      # query specific property if multiple
+    ?s text:query ('word' 10)              # with limit on results
+    (?s ?score) text:query 'word'          # query capturing also the score
+    (?s ?score ?literal) text:query 'word' # ... and original literal value
+    
+The most general form is:
+   
+     (?s ?score ?literal) text:query (property 'query string' 'limit')
+
+Only the query string is required, and if it is the only argument the
+surrounding `( )` can be omitted.
+
+The property URI is only necessary if multiple properties have been indexed.
+
+| &nbsp;Argument&nbsp;  | &nbsp; Definition&nbsp;    |
+|-------------------|--------------------------------|
+| property          | The URI (inc prefix name form) |
+| query string      | The native query string        |
+| limit             | The limit on the results       |
+
+### Good practice
+
+The query execution does not know the selectivity of the text index.  It is
+better to use one of two styles.
+
+#### Query pattern 1 &ndash; Find in the text index and enhance results
+
+Access to the index is first in the query and used to find a number of
+items of interest; further information is obtained about these items from
+the RDF data.
+
+    SELECT ?s
+    { ?s text:query (rdfs:label 'word' 10) ; 
+         rdfs:label ?label ;
+         rdf:type   ?type 
+    }
+
+Limit is useful here when working with large indexes to limit results to the
+more higher scoring results.
+
+#### Query pattern 2 &ndash; Filter 
+
+By finding items of interest first in the RDF data, the text search can be
+used to restrict the items found still further.
+
+    SELECT ?s
+    { ?s rdf:type     :book ;
+         dc:creator  "John" .
+      ?s text:query   (dc:title 'word') ; 
+    }
+
+## Configuration
+
+The usual way to describe an index is with a 
+[Jena assembler description](../assembler/index.html).  Configurations can
+also be built with code. The assembler describes a 'text
+dataset' which has an underlying RDF dataset and a text index. The text
+index describes the text index technology (Lucene or Solr) and the details
+needed for for each.
+
+A text index has an "entity map" which defines the properties to
+index, the name of the lucene/solr field and field used for storing the URI
+itself.
+
+For common RDF use, there will be one field, mapping a property to a text
+index field. More complex setups, with multiple properties per entity
+(URI) are possible.
+
+Once setup this way, any data added to the text dataset is automatically
+indexed as well.
+
+### Text Dataset Assembler
+
+The following is an example of a TDB dataset with a text index.
+
+    @prefix :        <http://localhost/jena_example/#> .
+    @prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+    @prefix tdb:     <http://jena.hpl.hp.com/2008/tdb#> .
+    @prefix ja:      <http://jena.hpl.hp.com/2005/11/Assembler#> .
+    @prefix text:    <http://jena.apache.org/text#> .
+
+    ## Example of a TDB dataset and text index
+    ## Initialize TDB
+    [] ja:loadClass "org.apache.jena.tdb.TDB" .
+    tdb:DatasetTDB  rdfs:subClassOf  ja:RDFDataset .
+    tdb:GraphTDB    rdfs:subClassOf  ja:Model .
+
+    ## Initialize text query
+    [] ja:loadClass       "org.apache.jena.query.text.TextQuery" .
+    # A TextDataset is a regular dataset with a text index.
+    text:TextDataset      rdfs:subClassOf   ja:RDFDataset .
+    # Lucene index
+    text:TextIndexLucene  rdfs:subClassOf   text:TextIndex .
+    # Solr index
+    text:TextIndexSolr    rdfs:subClassOf   text:TextIndex .
+
+    ## ---------------------------------------------------------------
+    ## This URI must be fixed - it's used to assemble the text dataset.
+
+    :text_dataset rdf:type     text:TextDataset ;
+        text:dataset   <#dataset> ;
+        text:index     <#indexLucene> ;
+        .
+
+    # A TDB datset used for RDF storage
+    <#dataset> rdf:type      tdb:DatasetTDB ;
+        tdb:location "DB" ;
+        tdb:unionDefaultGraph true ; # Optional
+        .
+    
+    # Text index description
+    <#indexLucene> a text:TextIndexLucene ;
+        text:directory <file:Lucene> ;
+        ##text:directory "mem" ;
+        text:entityMap <#entMap> ;
+        .
+
+    # Mapping in the index
+    # URI stored in field "uri"
+    # rdfs:label is mapped to field "text"
+    <#entMap> a text:EntityMap ;
+        text:entityField      "uri" ;
+        text:defaultField     "text" ;
+        text:map (
+             [ text:field "text" ; text:predicate rdfs:label ]
+             ) .
+
+then use code such as:
+
+    Dataset ds = DatasetFactory.assemble(
+        "text-config.ttl", 
+        "http://localhost/jena_example/#text_dataset") ;
+
+Key here is that the assembler contains two dataset definitions, one for
+the text dataset, one for the base data.  Therefore, the application
+needs to identify the text dataset by it's URI
+`http://localhost/jena_example/#text_dataset`.
+
+### Configuring an Analyzer
+
+Text to be indexed is passed through a text analyzer that divides it into tokens 
+and may perform other transformations such as eliminating stop words. If a Solr text
+index is used, the analyzer used is determined by the Solr configuration.
+If a Lucene text index is used, then by default a `StandardAnalyzer` is used. However, 
+it can be replaced by another analyzer with the `text:analyzer` property. 
+For example with a `SimpleAnalyzer`:   
+
+    <#indexLucene> a text:TextIndexLucene ;
+            text:directory <file:Lucene> ;
+            text:analyzer [
+                a text:SimpleAnalyzer
+            ]
+            . 
+
+It is possible to configure an alternative analyzer for each field indexed in a
+Lucene index.  For example:
+
+    <#entMap> a text:EntityMap ;
+        text:entityField      "uri" ;
+        text:defaultField     "text" ;
+        text:map (
+             [ text:field "text" ; 
+               text:predicate rdfs:label ;
+               text:analyzer [
+                   a text:StandardAnalyzer ;
+                   text:stopWords ("a" "an" "and" "but")
+               ]
+             ]
+             ) .
+             
+will configure the index to analyze values of the 'text' field
+using a `StandardAnalyzer` with the given list of stop words.
+
+Other analyzer types that may be specified are `SimpleAnalyzer` and
+`KeywordAnalyzer`, neither of which has any configuration parameters. See
+the Lucene documentation for details of what these analyzers do. Jena also
+provides `LowerCaseKeywordAnalyzer`, which is a case-insensitive version of
+`KeywordAnalyzer`, and `ConfigurableAnalyzer` (see below).
+
+Support for the new `LocalizedAnalyzer` has been introduced in Jena 3.0.0 to
+deal with Lucene language specific analyzers. See [Linguistic Support with
+Lucene Index](#linguistic-support-with-lucene-index) part for details.
+
+#### ConfigurableAnalyzer
+
+`ConfigurableAnalyzer` was introduced in Jena 3.0.1. It allows more detailed
+configuration of text analysis parameters by independently selecting a
+`Tokenizer` and zero or more `TokenFilter`s which are applied in order after
+tokenization. See the Lucene documentation for details on what each
+tokenizer and token filter does.
+
+The available `Tokenizer` implementations are:
+
+* `StandardTokenizer`
+* `KeywordTokenizer`
+* `WhitespaceTokenizer`
+* `LetterTokenizer`
+
+The available `TokenFilter` implementations are:
+
+* `StandardFilter`
+* `LowerCaseFilter`
+* `ASCIIFoldingFilter`
+
+Configuration is done using Jena assembler like this:
+
+    text:analyzer [
+      a text:ConfigurableAnalyzer ;
+      text:tokenizer text:KeywordTokenizer ;
+      text:filters (text:ASCIIFoldingFilter, text:LowerCaseFilter)
+    ]
+
+Here, `text:tokenizer` must be one of the four tokenizers listed above and
+the optional `text:filters` property specifies a list of token filters.
+
+#### Analyzer for Query
+
+New in Jena 2.13.0.
+
+There is an ability to specify an analyzer to be used for the
+query string itself.  It will find terms in the query text.  If not set, then the
+analyzer used for the document will be used.  The query analyzer is specified on
+the `TextIndexLucene` resource:
+
+    <#indexLucene> a text:TextIndexLucene ;
+        text:directory <file:Lucene> ;
+        text:entityMap <#entMap> ;
+        text:queryAnalyzer [
+            a text:KeywordAnalyzer
+        ]
+        .
+
+### Configuration by Code
+
+A text dataset can also be constructed in code as might be done for a
+purely in-memory setup:
+
+        // Example of building a text dataset with code.
+        // Example is in-memory.
+        // Base dataset
+        Dataset ds1 = DatasetFactory.createMem() ; 
+
+        EntityDefinition entDef = new EntityDefinition("uri", "text", RDFS.label) ;
+
+        // Lucene, in memory.
+        Directory dir =  new RAMDirectory();
+        
+        // Join together into a dataset
+        Dataset ds = TextDatasetFactory.createLucene(ds1, dir, entDef) ;
+
+### Graph-specific Indexing
+
+Starting with version 1.0.1, jena-text supports
+storing information about the source graph into the text index. This allows
+for more efficient text queries when the query targets only a single named
+graph. Without graph-specific indexing, text queries do not distinguish named
+graphs and will always return results from all graphs.
+
+Support for graph-specific indexing is enabled by defining the name of the
+index field to use for storing the graph identifier.
+
+If you use an assembler configuration, set the graph field using the
+text:graphField property on the EntityMap, e.g.
+
+    # Mapping in the index
+    # URI stored in field "uri"
+    # Graph stored in field "graph"
+    # rdfs:label is mapped to field "text"
+    <#entMap> a text:EntityMap ;
+        text:entityField      "uri" ;
+        text:graphField       "graph" ;
+        text:defaultField     "text" ;
+        text:map (
+             [ text:field "text" ; text:predicate rdfs:label ]
+             ) .
+
+If you configure the index in Java code, you need to use one of the
+EntityDefinition constructors that support the graphField parameter, e.g.
+
+        EntityDefinition entDef = new EntityDefinition("uri", "text", "graph", RDFS.label.asNode()) ;
+
+**Note:** If you migrate from a global (non-graph-aware) index to a graph-aware index,
+you need to rebuild the index to ensure that the graph information is stored.
+
+### Linguistic support with Lucene index
+
+It is now possible to take advantage of languages of triple literals to enhance 
+index and queries. Sub-sections below detail different settings with the index, 
+and use cases with SPARQL queries.
+
+#### Explicit Language Field in the Index 
+
+Literals' languages of triples can be stored (during triple addition phase) into the 
+index to extend query capabilities. 
+For that, the new `text:langField` property must be set in the EntityMap assembler :
+
+    <#entMap> a text:EntityMap ;
+        text:entityField      "uri" ;
+        text:defaultField     "text" ;        
+        text:langField        "lang" ;       
+        . 
+
+If you configure the index via Java code, you need to set this parameter to the 
+EntityDefinition instance, e.g.
+
+    EntityDefinition docDef = new EntityDefinition(entityField, defaultField);
+    docDef.setLangField("lang");
+
+ 
+#### SPARQL Linguistic Clause Forms
+
+Once the `langField` is set, you can use it directly inside SPARQL queries, for that the `'lang:xx'`
+argument allows you to target specific localized values. For example:
+
+    //target english literals
+    ?s text:query (rdfs:label 'word' 'lang:en' ) 
+    
+    //target unlocalized literals
+    ?s text:query (rdfs:label 'word' 'lang:none') 
+    
+    //ignore language field
+    ?s text:query (rdfs:label 'word')
+
+
+#### LocalizedAnalyzer
+
+You can specify and use a LocalizedAnalyzer in order to benefit from Lucene language 
+specific analyzers (stemming, stop words,...). Like any others analyzers, it can 
+be done for default text indexation, for each different field or for query.
+
+With an assembler configuration, the `text:language` property needs to be provided, e.g :
+
+    <#indexLucene> a text:TextIndexLucene ;
+        text:directory <file:Lucene> ;
+        text:entityMap <#entMap> ;
+        text:analyzer [
+            a text:LocalizedAnalyzer ;
+            text:language "fr"
+        ]
+        .
+
+will configure the index to analyze values of the 'text' field using a FrenchAnalyzer.
+
+To configure the same example via Java code, you need to provide the analyzer to the
+index configuration object:
+
+        TextIndexConfig config = new TextIndexConfig(def);
+        Analyzer analyzer = Util.getLocalizedAnalyzer("fr");
+        config.setAnalyzer(analyzer);
+        Dataset ds = TextDatasetFactory.createLucene(ds1, dir, config) ;
+
+Where `def`, `ds1` and `dir` are instances of `EntityDefinition`, `Dataset` and 
+`Directory` classes.
+
+**Note**: You do not have to set the `text:langField` property with a single 
+localized analyzer.
+
+#### Multilingual Support
+
+Let us suppose that we have many triples with many localized literals in many different 
+languages. It is possible to take all this languages into account for future mixed localized queries.
+Just set the `text:multilingualSupport` property at `true` to automatically enable the localized
+indexation (and also the localized analyzer for query) :
+
+    <#indexLucene> a text:TextIndexLucene ;
+        text:directory "mem" ;
+        text:multilingualSupport true;     
+        .
+
+Via Java code, set the multilingual support flag : 
+
+        TextIndexConfig config = new TextIndexConfig(def);
+        config.setMultilingualSupport(true);
+        Dataset ds = TextDatasetFactory.createLucene(ds1, dir, config) ;
+
+Thus, this multilingual index combines dynamically all localized analyzers of existing languages and 
+the storage of langField properties.
+
+For example, it is possible to involve different languages into the same text search query :
+
+    SELECT ?s
+    WHERE {
+        { ?s text:query ( rdfs:label 'institut' 'lang:fr' ) }
+        UNION
+        { ?s text:query ( rdfs:label 'institute' 'lang:en' ) }
+    }
+
+Hence, the result set of the query will contain "institute" related subjects 
+(institution, institutional,...) in French and in English.
+
+**Note**: If the `text:langField` property is not set, the "lang" field will be
+used anyway by default, because multilingual index cannot work without it.
+
+### Storing Literal Values
+
+New in Jena 3.0.0.
+
+It is possible to configure the text index to store enough information in the
+text index to be able to access the original indexed literal values at query time.
+This is controlled by two configuration options. First, the `text:storeValues` property
+must be set to `true` for the text index:
+
+    <#indexLucene> a text:TextIndexLucene ;
+        text:directory "mem" ;
+        text:storeValues true;     
+        .
+
+Or using Java code, used the `setValueStored` method of `TextIndexConfig`:
+
+        TextIndexConfig config = new TextIndexConfig(def);
+        config.setValueStored(true);
+
+Additionally, setting the `langField` configuration option is recommended. See 
+[Linguistic Support with Lucene Index](#linguistic-support-with-lucene-index) 
+for details. Without the `langField` setting, the stored literals will not have 
+language tag or datatype information.
+
+At query time, the stored literals can be accessed by using a 3-element list
+of variables as the subject of the `text:query` property function. The literal
+value will be bound to the third variable:
+
+    (?s ?score ?literal) text:query 'word'
+
+## Working with Fuseki
+
+The Fuseki configuration simply points to the text dataset as the
+`fuseki:dataset` of the service.
+
+    <#service_text_tdb> rdf:type fuseki:Service ;
+        rdfs:label                      "TDB/text service" ;
+        fuseki:name                     "ds" ;
+        fuseki:serviceQuery             "query" ;
+        fuseki:serviceQuery             "sparql" ;
+        fuseki:serviceUpdate            "update" ;
+        fuseki:serviceUpload            "upload" ;
+        fuseki:serviceReadGraphStore    "get" ;
+        fuseki:serviceReadWriteGraphStore    "data" ;
+        fuseki:dataset                  :text_dataset ;
+        .
+
+## Building a Text Index
+
+When working at scale, or when preparing a published, read-only, SPARQL
+service, creating the index by loading the text dataset is impractical.  
+The index and the dataset can be built using command line tools in two
+steps: first load the RDF data, second create an index from the existing
+RDF dataset.
+
+### Step 1 - Building a TDB dataset
+
+**Note:** If you have an existing TDB dataset then you can skip this step
+
+Build the TDB dataset:
+
+    java -cp $FUSEKI_HOME/fuseki-server.jar tdb.tdbloader --tdb=assembler_file data_file
+
+using the copy of TDB included with Fuseki.
+
+Alternatively, use one of the
+[TDB utilities](../tdb/commands.html) `tdbloader` or `tdbloader2` which are better for bulk loading:
+
+    $JENA_HOME/bin/tdbloader --loc=directory  data_file
+
+### Step 2 - Build the Text Index
+
+You can then build the text index with the `jena.textindexer` tool:
+
+    java -cp $FUSEKI_HOME/fuseki-server.jar jena.textindexer --desc=assembler_file
+
+Because a Fuseki assembler description can have several datasets descriptions, 
+and several text indexes, it may be necessary to extract a single dataset and index description
+into a separate assembler file for use in loading.
+
+#### Updating the index
+
+If you allow updates to the dataset through Fuseki, the configured index
+will automatically be updated on every modification.  This means that you
+do not have to run the above mentioned `jena.textindexer` after updates,
+only when you want to rebuild the index from scratch.
+
+## Deletion of Indexed Entities
+
+If the text index is being maintain by changed to the RDF, then deletion of
+RDF triple or quads does not cause entries in the index to be removed.  The
+index does not store the literal indexed, nor does it store a reference
+count of how many triples refer to the index so the information to delete
+entries is not available. 
+
+In situations where this matters, the SPARQL query should look up in the
+text index, then check in the RDF data.  Indeed, this may be necessary
+anyway because a text search does not necessarily give only exact matches.
+
+In the initial example:
+
+    SELECT ?s ?label
+    { ?s text:query (rdfs:label 'word' 10) ; 
+         rdfs:label ?label 
+    }
+
+the SPARQL query is checking that the `rdfs:label` triple exists, and if it
+does, returning the whole label.
+
+
+Jena 3.0 provides a solution to address this situation. RDF triple deletion can be 
+synchronized within the index. Each removed triple literals in the graph can automatically 
+have their related entry removed in the index. A unique ID is computed, and stored in the index, 
+to represent the quad. It guarantees the uniqueness of the stored information and 
+allows to retrieve it easily.
+
+To enable Deletion support, this uid field must be provided within the configuration.
+
+If you use an assembler configuration, set the uid field using the `text:uidField` property 
+on the EntityMap, e.g.
+
+    <#entMap> a text:EntityMap ;
+        text:entityField      "uri" ;
+        text:defaultField     "text" ;        
+        text:uidField         "uid" ;       
+        . 
+
+If you configure the index via Java code, you need to set this parameter to the 
+EntityDefinition instance, e.g.
+
+    EntityDefinition docDef = new EntityDefinition(entityField, defaultField);
+    docDef.setUidField("uid");
+
+**Note**: If you migrate from a global (non-deletion-support) index to a deletion-support 
+index, you need to rebuild the index to ensure that the uid information is
+stored.
+
+# Configuring Alternative TextDocProducers
+
+The default behaviour when text indexing is to index a single
+property as a single field, generating a different `Document` 
+for each indexed triple. To change this behaviour requires 
+writing and configuring an alternative `TextDocProducer`.
+
+To configure a `TextDocProducer`, say `net.code.MyProducer` in a dataset assembly,
+use the property `textDocProducer`, eg:
+
+	<#ds-with-lucene> rdf:type text:TextDataset;
+		text:index <#indexLucene> ;
+		text:dataset <#ds> ;
+		text:textDocProducer <java:net.code.MyProducer> ;
+		.
+
+where `CLASSNAME` is the full java class name. It must have either
+a single-argument constructor of type `TextIndex`, or a two-argument
+constructor `(DatasetGraph, TextIndex)`. The `TextIndex` argument
+will be the configured text index, and the `DatasetGraph` argument
+will be the graph of the configured dataset.
+
+For example, to explicitly create the default `TextDocProducer` use:
+
+	...
+	    text:textDocProducer <java:org.apache.jena.query.text.TextDocProducerTriples> ;
+	...
+
+`TextDocProducerTriples` produces a new document for each subject/field
+added to the dataset, using `TextIndex.addEntity(Entity)`. 
+
+## Example 
+
+The example class below is a `TextDocProducer` that only indexes
+`ADD`s of quads for which the subject already had at least one
+property-value. It uses the two-argument constructor to give it
+access to the dataset so that it count the `(?G, S, P, ?O)` quads
+with that subject and predicate, and delegates the indexing to
+`TextDocProducerTriples` if there are at least two values for
+that property (one of those values, of course, is the one that
+gives rise to this `change()`).
+
+      public class Example extends TextDocProducerTriples {
+      
+          final DatasetGraph dg;
+          
+          public Example(DatasetGraph dg, TextIndex indexer) {
+              super(indexer);
+              this.dg = dg;
+          }
+          
+          public void change(QuadAction qaction, Node g, Node s, Node p, Node o) {
+              if (qaction == QuadAction.ADD) {
+                  if (alreadyHasOne(s, p)) super.change(qaction, g, s, p, o);
+              }
+          }
+      
+          private boolean alreadyHasOne(Node s, Node p) {
+              int count = 0;
+              Iterator<Quad> quads = dg.find( null, s, p, null );
+              while (quads.hasNext()) { quads.next(); count += 1; }
+              return count > 1;
+          }
+      }
+
+
+## Maven Dependency
+
+The <code>jena-text</code> module is included in Fuseki.  To use it within application code,
+then use the following maven dependency:
+
+    <dependency>
+      <groupId>org.apache.jena</groupId>
+      <artifactId>jena-text</artifactId>
+      <version>X.Y.Z</version>
+    </dependency>
+
+adjusting the version <code>X.Y.Z</code> as necessary.  This will automatically
+include a compatible version of Lucene and the Solr java client, but not Solr server.
